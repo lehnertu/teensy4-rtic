@@ -1,0 +1,31 @@
+[package]
+name = "teensy4_rtic_sdcard"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+teensy4-bsp = { version = "0.5", features = ["rt"] }
+teensy4-panic = { version = "0.2", default-features = false }
+imxrt-hal = "0.5"
+imxrt-ral = "0.5"
+cortex-m = "0.7"
+
+# this is the embedded-hal version the bsp depends on
+eh02 = { package = "embedded-hal", version = "0.2.7" }
+rtic = { version = "2", features = ["thumbv7-backend"] }
+rtic-monotonics = { version = "2.1.0", default-features = false, features = ["cortex-m-systick"] }
+
+imxrt-log = { version = "0.1", default-features = false, features = ["log", "usbd"] }
+log = { version = "0.4", features = ["max_level_debug", "release_max_level_info"] }
+imxrt-usdhc = { path = "../imxrt-usdhc" }
+
+[patch.crates-io]
+sdio-host = { path = "../sdio-host" }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
