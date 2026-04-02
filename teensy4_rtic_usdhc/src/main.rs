@@ -31,6 +31,10 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 // SPI cannot be used with the pin connections of the card socket
 // we have to use SDIO
 
+// Timing dividers 128 and 1 from 49.5 Mhz (nominal 387 kHz) => 2760 µs/block = 370 kHz effective clock
+// Timing dividers 16 and 1 from 49.5 Mhz (nominal 3.1 MHz) => 574 µs/block = 1.78 MHz effective clock
+// Timing dividers 8 and 1 from 49.5 Mhz => 415 µs/block = 2.47 MHz effective clock
+
 #[rtic::app(device = teensy4_bsp, peripherals = true, dispatchers=[KPP])]
 mod app {
 
@@ -167,35 +171,32 @@ mod app {
     #[task(shared = [host])]
     async fn sd_init(mut cx: sd_init::Context) {
 
-        // delay between log lines not to flood the USB connection
-        const LOG_LINE_DELAY_MS: u32 = 50;
-
         // only after some time the USB connection is ready to receive logs
         Mono::delay(5_000.millis()).await;
 
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             log::info!("RCA: {:#06X}", host.rca().address());
         });
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             log::info!("CID: {:?}", host.cid());
         });
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             log::info!("CSD: {:?}", host.csd());
         });
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             log::info!("SCR: {:?}", host.scr());
         });
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             log::info!("SD status: {:?}", host.sd_status());
         });
         
         // Log speed capabilities
-        Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+        Mono::delay(50.millis()).await;
         cx.shared.host.lock(|host| {
             let csd = host.csd();
             let sd_status = host.sd_status();
@@ -213,13 +214,10 @@ mod app {
     #[task(shared = [host], local = [led])]
     async fn log_block0(mut cx: log_block0::Context) {
 
-        // delay between log lines not to flood the USB connection
-        const LOG_LINE_DELAY_MS: u32 = 50;
-
         // Idle state low. During a block read, set high for timing on scope.
         cx.local.led.clear();
 
-        loop {
+        for _ in 0..3 {
             // read block 0 of the card
             let mut block0 = [0u8; 512];
             cx.local.led.set();
@@ -231,12 +229,109 @@ mod app {
             cx.local.led.clear();
             let read_us = (read_cycles as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
 
-            Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+            Mono::delay(50.millis()).await;
             log::info!("read_block(0): {} cycles ({} us)", read_cycles, read_us);
-            Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+            Mono::delay(50.millis()).await;
             log::info!("Block 0:");
             for (row, chunk) in block0.chunks_exact(32).enumerate() {
-                Mono::delay(LOG_LINE_DELAY_MS.millis()).await;
+                Mono::delay(50.millis()).await;
+                log::info!("{:03X}: {}", row * 32, HexLine(chunk));
+            }
+
+            // Repeat block 0 dump every 2 seconds after finishing one dump.
+            Mono::delay(2_000.millis()).await;
+        }
+
+        // After 3 times reading and logging block 0,
+        // switch to high speed mode and run 3 high-speed reads before entering infinite high-speed logging.
+        log_block0_high_speed::spawn().unwrap();
+    }
+
+    #[task(shared = [host])]
+    async fn log_block0_high_speed(mut cx: log_block0_high_speed::Context) {
+
+        // set higher clock speed: 49.5 MHz / SDCLKFS(8) / DVS(1) ≈ 6.2 MHz
+        cx.shared.host.lock(|host| {
+            host.transport_mut().set_timing(Timing {
+                divisor: 1,
+                data_rate: DataRate::SingleDataRate(SDRPrescaler::Divide8),
+            });
+        });
+        Mono::delay(50.millis()).await;
+
+        for _ in 0..3 {
+            // read block 0 of the card
+            let mut block0 = [0u8; 512];
+
+            let read_cycles = cx.shared.host.lock(|host| {
+                let start = DWT::cycle_count();
+                host.read_block(0, &mut block0).unwrap();
+                DWT::cycle_count().wrapping_sub(start)
+            });
+            let read_us = (read_cycles as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
+
+            Mono::delay(50.millis()).await;
+            log::info!("read_block(0): {} cycles ({} us)", read_cycles, read_us);
+            Mono::delay(50.millis()).await;
+            log::info!("Block 0:");
+            for (row, chunk) in block0.chunks_exact(32).enumerate() {
+                Mono::delay(50.millis()).await;
+                log::info!("{:03X}: {}", row * 32, HexLine(chunk));
+            }
+
+            // Repeat block 0 dump every 2 seconds after finishing one dump.
+            Mono::delay(2_000.millis()).await;
+        }
+
+        // Write block 0 once, then continue with forever high-speed logging.
+        write_block0::spawn().unwrap();
+    }
+
+    #[task(shared = [host])]
+    async fn write_block0(mut cx: write_block0::Context) {
+
+        // Start from an empty (zeroed) payload.
+        let mut block0 = [0u8; 512];
+        // Modify this buffer before writing.
+        let tag = "Teensy RTIC FS tag log";
+        let tag_bytes = tag.as_bytes();
+        block0[..tag_bytes.len()].copy_from_slice(tag_bytes);
+
+        let write_result = cx.shared.host.lock(|host| host.write_block(0, &block0));
+
+        Mono::delay(50.millis()).await;
+        match write_result {
+            Ok(()) => {
+                log::info!("write_block(0): done (512-byte buffer written)");
+            }
+            Err(err) => {
+                log::error!("write_block(0) failed: {:?}", err);
+            }
+        }
+
+        log_block0_high_speed_forever::spawn().unwrap();
+    }
+
+    #[task(shared = [host])]
+    async fn log_block0_high_speed_forever(mut cx: log_block0_high_speed_forever::Context) {
+
+        loop {
+            // read block 0 of the card
+            let mut block0 = [0u8; 512];
+
+            let read_cycles = cx.shared.host.lock(|host| {
+                let start = DWT::cycle_count();
+                host.read_block(0, &mut block0).unwrap();
+                DWT::cycle_count().wrapping_sub(start)
+            });
+            let read_us = (read_cycles as u64 * 1_000_000) / (board::ARM_FREQUENCY as u64);
+
+            Mono::delay(50.millis()).await;
+            log::info!("read_block(0): {} cycles ({} us)", read_cycles, read_us);
+            Mono::delay(50.millis()).await;
+            log::info!("Block 0:");
+            for (row, chunk) in block0.chunks_exact(32).enumerate() {
+                Mono::delay(50.millis()).await;
                 log::info!("{:03X}: {}", row * 32, HexLine(chunk));
             }
 
